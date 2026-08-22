@@ -1,0 +1,1426 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LK TIROL Fahrtenbuch</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-stone-50">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+function haversine(a, b) {
+  const R = 6371;
+  const dLat = ((b.latitude - a.latitude) * Math.PI) / 180;
+  const dLon = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const lat1 = (a.latitude * Math.PI) / 180;
+  const lat2 = (b.latitude * Math.PI) / 180;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+async function reverseGeocode(lat, lon) {
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`);
+    const data = await res.json();
+    const a = data.address || {};
+    const ort = a.city || a.town || a.village || a.municipality || a.county || a.state || "";
+    const label = a.postcode && ort ? `${a.postcode} ${ort}` : ort;
+    return label || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  } catch {
+    return `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  }
+}
+
+// Ergänzt eine manuell eingegebene Ortsangabe live um die Postleitzahl (OpenStreetMap/Nominatim),
+// beschränkt auf Österreich, Deutschland, Südtirol/Italien und die Schweiz.
+async function withPLZ(placeName) {
+  const name = (placeName || "").trim();
+  if (!name) return name;
+  if (/\b\d{4,5}\b/.test(name)) return name; // enthält schon eine PLZ-ähnliche Zahl
+  try {
+    // Schritt 1: Ort suchen, um Koordinaten zu bekommen
+    const searchRes = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(name)}&countrycodes=at,de,ch,it&limit=1`
+    );
+    const searchData = await searchRes.json();
+    const hit = searchData && searchData[0];
+    if (!hit) return name;
+
+    // Direkter Treffer liefert manchmal schon eine PLZ (z. B. bei Adressen/kleinen Orten)
+    if (hit.address && hit.address.postcode) {
+      return `${hit.address.postcode} ${name}`;
+    }
+
+    // Schritt 2: an den gefundenen Koordinaten rückwärts geokodieren, das liefert zuverlässiger eine PLZ
+    const revRes = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${hit.lat}&lon=${hit.lon}&zoom=16&addressdetails=1`
+    );
+    const revData = await revRes.json();
+    const plz = revData && revData.address && revData.address.postcode;
+    return plz ? `${plz} ${name}` : name;
+  } catch {
+    return name;
+  }
+}
+
+// Ermittelt Koordinaten für einen Ortsnamen (für die Routenberechnung über Zwischenziele)
+async function geocodeName(name) {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(name)}&countrycodes=at,de,ch,it&limit=1`
+    );
+    const data = await res.json();
+    if (data && data[0]) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+  } catch {}
+  return null;
+}
+
+// Berechnet die gefahrene Straßen-Strecke (nicht Luftlinie) über eine Reihe von Orten via OSRM
+async function computeRouteKm(addresses) {
+  const coords = [];
+  for (const addr of addresses) {
+    const g = await geocodeName(addr);
+    if (!g) return null;
+    coords.push(`${g.lon},${g.lat}`);
+  }
+  if (coords.length < 2) return null;
+  try {
+    const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coords.join(";")}?overview=false`);
+    const data = await res.json();
+    if (data.code === "Ok" && data.routes && data.routes[0]) {
+      return data.routes[0].distance / 1000;
+    }
+  } catch {}
+  return null;
+}
+
+function getPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error("Kein GPS verfügbar"));
+    navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: true,
+      timeout: 15000,
+      maximumAge: 0,
+    });
+  });
+}
+
+function fmtDate(d) { return d.toLocaleDateString("de-DE"); }
+function fmtTime(d) { return d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" }); }
+function fmtElapsed(sec) {
+  const m = String(Math.floor(sec / 60)).padStart(2, "0");
+  const s = String(sec % 60).padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+const ZWECK_PRESETS = ["Kundenbesuch", "Meeting", "Auslieferung", "Materialeinkauf", "Sonstiges"];
+const ZWECK_COLORS = [
+  "bg-green-600 border-green-600",
+  "bg-teal-600 border-teal-600",
+  "bg-lime-600 border-lime-600",
+  "bg-amber-500 border-amber-500",
+  "bg-emerald-700 border-emerald-700",
+];
+const STORAGE_KEY = "fahrtenbuch_trips";
+const ACTIVE_KEY = "fahrtenbuch_active_trip";
+const FAHRER = "Ulrich J. Zeni";
+const FAHRZEUG = "BMW iX1 / I-5674AX";
+const REPORT_EMAIL = "ulrich.zeni@lk-tirol.at";
+const WEEK_REPORT_KEY = "fahrtenbuch_last_week_report";
+
+function saveActiveTrip(data) {
+  try { localStorage.setItem(ACTIVE_KEY, JSON.stringify(data)); } catch {}
+}
+function loadActiveTrip() {
+  try { const raw = localStorage.getItem(ACTIVE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+function clearActiveTrip() {
+  try { localStorage.removeItem(ACTIVE_KEY); } catch {}
+}
+function pad2(n) { return String(n).padStart(2, "0"); }
+function toDateInputValue(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+function toTimeInputValue(d) { return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; }
+
+function Fahrtenbuch() {
+  const [trips, setTrips] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; } catch { return []; }
+  });
+  const [weekReport, setWeekReport] = useState(null);
+  const [status, setStatus] = useState("idle");
+  const [error, setError] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const [liveKm, setLiveKm] = useState(0);
+  const [pendingTrip, setPendingTrip] = useState(null);
+  const [zweckInput, setZweckInput] = useState("");
+  const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7));
+  const [showManual, setShowManual] = useState(false);
+  const [manualForm, setManualForm] = useState({ date: "", startTime: "", endTime: "", startAddress: "", endAddress: "", km: "", zweck: "", waypoints: [] });
+  const [manualError, setManualError] = useState("");
+  const [odoStep, setOdoStep] = useState(null); // null | "start" | "end"
+  const [odoPhoto, setOdoPhoto] = useState(null);
+  const [odoValue, setOdoValue] = useState("");
+  const [odoLoading, setOdoLoading] = useState(false);
+  const [odoError, setOdoError] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState(null);
+  const [editError, setEditError] = useState("");
+  const [endFallback, setEndFallback] = useState(null);
+  const [endFallbackForm, setEndFallbackForm] = useState({ address: "", km: "", endOdo: "" });
+  const [endFallbackError, setEndFallbackError] = useState("");
+  const [needsStartAddress, setNeedsStartAddress] = useState(false);
+  const [startAddressInput, setStartAddressInput] = useState("");
+  const [pendingKmForm, setPendingKmForm] = useState({ startOdo: "", endOdo: "", km: "" });
+  const [pendingWaypoints, setPendingWaypoints] = useState([]);
+  const [manualSaving, setManualSaving] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [endFallbackSaving, setEndFallbackSaving] = useState(false);
+  const [endFallbackWaypoints, setEndFallbackWaypoints] = useState([]);
+  const [routeCalcLoading, setRouteCalcLoading] = useState(false);
+  const [routeCalcError, setRouteCalcError] = useState("");
+  const [odoSaving, setOdoSaving] = useState(false);
+  const [zweckSaving, setZweckSaving] = useState(false);
+
+  const startRef = useRef(null);
+  const watchIdRef = useRef(null);
+  const lastPosRef = useRef(null);
+  const distRef = useRef(0);
+  const timerRef = useRef(null);
+  const stopAnchorRef = useRef(null);
+  const stopRecordedRef = useRef(false);
+  const waypointsRef = useRef([]);
+
+  const STOP_RADIUS_KM = 0.15;
+  const STOP_DURATION_MS = 20 * 60 * 1000;
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(trips));
+  }, [trips]);
+
+  const startTrip = async () => {
+    setError("");
+    let pos = null;
+    try {
+      pos = await getPosition();
+    } catch (e) {
+      pos = null;
+    }
+
+    const now = new Date();
+
+    if (pos) {
+      const { latitude, longitude } = pos.coords;
+      const address = await reverseGeocode(latitude, longitude);
+      startRef.current = { time: now.toISOString(), lat: latitude, lon: longitude, address, odoKm: null };
+      lastPosRef.current = { latitude, longitude };
+      stopAnchorRef.current = { latitude, longitude, since: now.getTime() };
+      setNeedsStartAddress(false);
+    } else {
+      startRef.current = { time: now.toISOString(), lat: null, lon: null, address: null, odoKm: null };
+      lastPosRef.current = null;
+      stopAnchorRef.current = null;
+      setNeedsStartAddress(true);
+      setStartAddressInput("");
+    }
+
+    distRef.current = 0;
+    stopRecordedRef.current = false;
+    waypointsRef.current = [];
+    setLiveKm(0);
+    setElapsed(0);
+    setStatus("active");
+
+    saveActiveTrip({
+      start: startRef.current,
+      distKm: 0,
+      lastPos: lastPosRef.current,
+      waypoints: [],
+      stopAnchor: stopAnchorRef.current,
+      stopRecorded: false,
+    });
+
+    beginWatching(now.getTime());
+
+    setOdoPhoto(null);
+    setOdoValue("");
+    setOdoError("");
+    setOdoStep("start");
+  };
+
+  const beginWatching = (startTimeMs) => {
+    timerRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTimeMs) / 1000));
+    }, 1000);
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (p) => {
+        const { latitude: la, longitude: lo, accuracy } = p.coords;
+        if (accuracy && accuracy < 50 && lastPosRef.current) {
+          const d = haversine(lastPosRef.current, { latitude: la, longitude: lo });
+          if (d > 0.005 && d < 2) {
+            distRef.current += d;
+            setLiveKm(distRef.current);
+          }
+        }
+        lastPosRef.current = { latitude: la, longitude: lo };
+
+        // Zwischenziel-Erkennung: Aufenthalt > 20 Minuten am selben Ort
+        if (accuracy && accuracy < 60) {
+          const nowTs = Date.now();
+          if (!stopAnchorRef.current) {
+            stopAnchorRef.current = { latitude: la, longitude: lo, since: nowTs };
+            stopRecordedRef.current = false;
+          } else {
+            const dStop = haversine(stopAnchorRef.current, { latitude: la, longitude: lo });
+            if (dStop < STOP_RADIUS_KM) {
+              if (!stopRecordedRef.current && nowTs - stopAnchorRef.current.since >= STOP_DURATION_MS) {
+                stopRecordedRef.current = true;
+                const anchor = stopAnchorRef.current;
+                reverseGeocode(anchor.latitude, anchor.longitude).then((addr) => {
+                  waypointsRef.current.push({ address: addr, arrival: new Date(anchor.since).toISOString(), departure: null });
+                  saveActiveTrip({
+                    start: startRef.current,
+                    distKm: distRef.current,
+                    lastPos: lastPosRef.current,
+                    waypoints: waypointsRef.current,
+                    stopAnchor: stopAnchorRef.current,
+                    stopRecorded: stopRecordedRef.current,
+                  });
+                });
+              }
+            } else {
+              if (stopRecordedRef.current && waypointsRef.current.length > 0) {
+                const last = waypointsRef.current[waypointsRef.current.length - 1];
+                if (!last.departure) last.departure = new Date(nowTs).toISOString();
+              }
+              stopAnchorRef.current = { latitude: la, longitude: lo, since: nowTs };
+              stopRecordedRef.current = false;
+            }
+          }
+        }
+
+        saveActiveTrip({
+          start: startRef.current,
+          distKm: distRef.current,
+          lastPos: lastPosRef.current,
+          waypoints: waypointsRef.current,
+          stopAnchor: stopAnchorRef.current,
+          stopRecorded: stopRecordedRef.current,
+        });
+      },
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 }
+    );
+  };
+
+  // Beim Öffnen der App prüfen, ob eine Fahrt noch läuft (auch nach Schließen/Neuöffnen)
+  useEffect(() => {
+    const saved = loadActiveTrip();
+    if (saved && saved.start) {
+      startRef.current = saved.start;
+      distRef.current = saved.distKm || 0;
+      lastPosRef.current = saved.lastPos || null;
+      waypointsRef.current = saved.waypoints || [];
+      stopAnchorRef.current = saved.stopAnchor || null;
+      stopRecordedRef.current = !!saved.stopRecorded;
+      setLiveKm(distRef.current);
+      const startMs = new Date(saved.start.time).getTime();
+      setElapsed(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
+      setStatus("active");
+      beginWatching(startMs);
+      if (!saved.start.address) {
+        setNeedsStartAddress(true);
+        setStartAddressInput("");
+        setOdoPhoto(null);
+        setOdoValue("");
+        setOdoError("");
+        setOdoStep("start");
+      }
+    }
+    // eslint-disable-next-line
+  }, []);
+
+  const endTrip = async () => {
+    setError("");
+    clearInterval(timerRef.current);
+    if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
+    clearActiveTrip();
+    setStatus("idle");
+
+    let pos = null;
+    try {
+      pos = await getPosition();
+    } catch (e) {
+      pos = null;
+    }
+
+    const rawKm = distRef.current;
+    const elapsedSec = (Date.now() - new Date(startRef.current.time).getTime()) / 1000;
+    const elapsedHrs = elapsedSec / 3600;
+    const avgSpeed = elapsedHrs > 0 ? rawKm / elapsedHrs : 0;
+    const implausible = (elapsedSec > 600 && rawKm < 0.3) || (elapsedHrs > 0 && avgSpeed > 150);
+
+    if (!pos || implausible) {
+      let address = "";
+      let lat = null;
+      let lon = null;
+      if (pos) {
+        lat = pos.coords.latitude;
+        lon = pos.coords.longitude;
+        try { address = await reverseGeocode(lat, lon); } catch { address = ""; }
+      } else if (lastPosRef.current) {
+        lat = lastPosRef.current.latitude;
+        lon = lastPosRef.current.longitude;
+        try { address = await reverseGeocode(lat, lon); } catch { address = ""; }
+      }
+      const roundedRaw = rawKm > 0 ? Math.round(rawKm) : null;
+      setEndFallback({ reason: !pos ? "gps" : "implausible", lat, lon, rawEstimate: roundedRaw });
+      setEndFallbackForm({ address, km: "", endOdo: "" });
+      setEndFallbackWaypoints((waypointsRef.current || []).map((w) => w.address));
+      setEndFallbackError("");
+      setRouteCalcError("");
+      return;
+    }
+
+    const { latitude, longitude } = pos.coords;
+    const address = await reverseGeocode(latitude, longitude);
+    const km = Math.max(Math.round(rawKm), 1);
+    const endOdoKm = startRef.current.odoKm != null ? Math.round(startRef.current.odoKm + km) : null;
+    setPendingTrip({
+      start: startRef.current,
+      end: { time: new Date().toISOString(), lat: latitude, lon: longitude, address, odoKm: endOdoKm },
+      km,
+      waypoints: waypointsRef.current,
+    });
+    setZweckInput("");
+  };
+
+  const fallbackKmChange = (value) => {
+    setEndFallbackForm((f) => {
+      const startNum = num(startRef.current.odoKm);
+      const kmNum = num(value);
+      const endOdo = startNum != null && kmNum != null ? String(Math.round(startNum + kmNum)) : f.endOdo;
+      return { ...f, km: value, endOdo };
+    });
+  };
+
+  const fallbackEndOdoChange = (value) => {
+    setEndFallbackForm((f) => {
+      const startNum = num(startRef.current.odoKm);
+      const endNum = num(value);
+      const km = startNum != null && endNum != null ? String(Math.max(0, Math.round(endNum - startNum))) : f.km;
+      return { ...f, endOdo: value, km };
+    });
+  };
+
+  const addFallbackWaypoint = () => setEndFallbackWaypoints((wp) => [...wp, ""]);
+  const updateFallbackWaypoint = (i, value) => setEndFallbackWaypoints((wp) => wp.map((w, idx) => (idx === i ? value : w)));
+  const removeFallbackWaypoint = (i) => setEndFallbackWaypoints((wp) => wp.filter((_, idx) => idx !== i));
+
+  const routeAddressChain = () =>
+    [startRef.current.address, ...endFallbackWaypoints.filter((w) => w.trim()), endFallbackForm.address].filter((a) => a && a.trim());
+
+  const calcRouteFromWaypoints = async () => {
+    const addresses = routeAddressChain();
+    if (addresses.length < 2) {
+      setRouteCalcError("Dafür werden mindestens Start- und Zielort benötigt.");
+      return null;
+    }
+    setRouteCalcLoading(true);
+    setRouteCalcError("");
+    const km = await computeRouteKm(addresses);
+    setRouteCalcLoading(false);
+    if (km == null) {
+      setRouteCalcError("Route konnte nicht berechnet werden. Bitte Orte prüfen oder Kilometer manuell eingeben.");
+      return null;
+    }
+    fallbackKmChange(String(Math.round(km)));
+    return km;
+  };
+
+  const confirmEndFallback = async () => {
+    if (!endFallbackForm.address.trim()) {
+      setEndFallbackError("Bitte Zielort angeben.");
+      return;
+    }
+    let kmVal = num(endFallbackForm.km);
+
+    // Strecke nicht erfasst und kein Km-Stand Ende eingetragen: automatisch über die
+    // Zwischenziele in Reihenfolge die gefahrene Strecke berechnen.
+    if ((kmVal == null || kmVal <= 0) && !endFallbackForm.endOdo) {
+      const routeKm = await calcRouteFromWaypoints();
+      if (routeKm == null) {
+        setEndFallbackError("Kilometer konnten nicht automatisch berechnet werden. Bitte manuell eingeben.");
+        return;
+      }
+      kmVal = routeKm;
+    }
+
+    if (kmVal == null || kmVal <= 0) {
+      setEndFallbackError("Bitte eine gültige Kilometerangabe machen.");
+      return;
+    }
+
+    setEndFallbackSaving(true);
+    const address = await withPLZ(endFallbackForm.address);
+    const waypointAddrs = await Promise.all(endFallbackWaypoints.filter((w) => w.trim()).map((w) => withPLZ(w)));
+    const km = Math.round(kmVal);
+    const endOdoKm =
+      startRef.current.odoKm != null
+        ? endFallbackForm.endOdo
+          ? Math.round(num(endFallbackForm.endOdo))
+          : Math.round(startRef.current.odoKm + km)
+        : null;
+    setPendingTrip({
+      start: startRef.current,
+      end: { time: new Date().toISOString(), lat: endFallback.lat, lon: endFallback.lon, address, odoKm: endOdoKm },
+      km,
+      waypoints: waypointAddrs.map((a) => ({ address: a, arrival: null, departure: null })),
+    });
+    setEndFallbackSaving(false);
+    setEndFallback(null);
+    setZweckInput("");
+  };
+
+  const handleOdoPhoto = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const dataUrl = reader.result;
+      setOdoPhoto(dataUrl);
+      setOdoLoading(true);
+      setOdoError("");
+      try {
+        const result = await Tesseract.recognize(dataUrl, "eng");
+        const text = result.data.text || "";
+        const matches = (text.match(/\d+/g) || []).filter((n) => n.length >= 3);
+        const best = matches.sort((a, b) => b.length - a.length)[0];
+        if (best) setOdoValue(best);
+        else setOdoError("Zahl konnte nicht automatisch erkannt werden. Bitte manuell eingeben.");
+      } catch (err) {
+        setOdoError("Zahl konnte nicht automatisch erkannt werden. Bitte manuell eingeben.");
+      } finally {
+        setOdoLoading(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const getLastOdoKm = () => {
+    const withOdo = trips.filter((t) => t.end && t.end.odoKm != null);
+    if (!withOdo.length) return null;
+    withOdo.sort((a, b) => new Date(b.end.time) - new Date(a.end.time));
+    return withOdo[0].end.odoKm;
+  };
+
+  const confirmStartOdo = async (valueOverride) => {
+    const value = valueOverride !== undefined ? valueOverride : odoValue;
+    if (needsStartAddress) {
+      if (!startAddressInput.trim()) {
+        setOdoError("Bitte Startort angeben.");
+        return;
+      }
+      setOdoSaving(true);
+      startRef.current.address = await withPLZ(startAddressInput);
+      setOdoSaving(false);
+    }
+    if (value) {
+      const val = parseFloat(value.replace(",", "."));
+      const lastOdo = getLastOdoKm();
+      if (lastOdo != null && val < lastOdo) {
+        setOdoError(`Der Kilometerstand darf nicht kleiner sein als der zuletzt erfasste Stand (${lastOdo} km).`);
+        return;
+      }
+      startRef.current.odoKm = val;
+    } else {
+      startRef.current.odoKm = null;
+    }
+    setOdoStep(null);
+    saveActiveTrip({
+      start: startRef.current,
+      distKm: distRef.current,
+      lastPos: lastPosRef.current,
+      waypoints: waypointsRef.current,
+      stopAnchor: stopAnchorRef.current,
+      stopRecorded: stopRecordedRef.current,
+    });
+  };
+
+  const confirmZweck = async () => {
+    if (!zweckInput.trim() || !pendingTrip) return;
+    setZweckSaving(true);
+    const waypointAddrs = await Promise.all(
+      pendingWaypoints.filter((w) => w.address.trim()).map((w) => withPLZ(w.address).then((address) => ({ ...w, address })))
+    );
+    const kmVal = num(pendingKmForm.km);
+    const startOdoVal = pendingKmForm.startOdo ? Math.round(num(pendingKmForm.startOdo)) : pendingTrip.start.odoKm ?? null;
+    const endOdoVal = pendingKmForm.endOdo ? Math.round(num(pendingKmForm.endOdo)) : pendingTrip.end.odoKm ?? null;
+    const trip = {
+      id: Date.now().toString(),
+      start: { ...pendingTrip.start, odoKm: startOdoVal },
+      end: { ...pendingTrip.end, odoKm: endOdoVal },
+      km: kmVal != null ? Math.round(kmVal) : pendingTrip.km,
+      zweck: zweckInput.trim(),
+      waypoints: waypointAddrs,
+    };
+    setTrips((t) => [trip, ...t]);
+    setZweckSaving(false);
+    setPendingTrip(null);
+    setZweckInput("");
+  };
+
+  useEffect(() => {
+    if (pendingTrip) {
+      setPendingKmForm({
+        startOdo: pendingTrip.start.odoKm != null ? String(pendingTrip.start.odoKm) : "",
+        endOdo: pendingTrip.end.odoKm != null ? String(pendingTrip.end.odoKm) : "",
+        km: String(Math.round(pendingTrip.km)),
+      });
+      setPendingWaypoints((pendingTrip.waypoints || []).map((w) => ({ ...w })));
+    }
+  }, [pendingTrip]);
+
+  const pendingKmChange = (value) => {
+    setPendingKmForm((f) => {
+      const startNum = num(f.startOdo);
+      const kmNum = num(value);
+      const endOdo = startNum != null && kmNum != null ? String(Math.round(startNum + kmNum)) : f.endOdo;
+      return { ...f, km: value, endOdo };
+    });
+  };
+  const pendingEndOdoChange = (value) => {
+    setPendingKmForm((f) => {
+      const startNum = num(f.startOdo);
+      const endNum = num(value);
+      const km = startNum != null && endNum != null ? String(Math.max(0, Math.round(endNum - startNum))) : f.km;
+      return { ...f, endOdo: value, km };
+    });
+  };
+  const pendingStartOdoChange = (value) => {
+    setPendingKmForm((f) => {
+      const startNum = num(value);
+      const endNum = num(f.endOdo);
+      const km = startNum != null && endNum != null ? String(Math.max(0, Math.round(endNum - startNum))) : f.km;
+      return { ...f, startOdo: value, km };
+    });
+  };
+
+  const addPendingWaypoint = () => setPendingWaypoints((wp) => [...wp, { address: "", arrival: null, departure: null }]);
+  const updatePendingWaypoint = (i, value) =>
+    setPendingWaypoints((wp) => wp.map((w, idx) => (idx === i ? { ...w, address: value } : w)));
+  const removePendingWaypoint = (i) => setPendingWaypoints((wp) => wp.filter((_, idx) => idx !== i));
+
+  const discardTrip = () => { setPendingTrip(null); setZweckInput(""); };
+  const deleteTrip = (id) => {
+    if (window.confirm("Diese Fahrt wirklich löschen? Das kann nicht rückgängig gemacht werden.")) {
+      setTrips((t) => t.filter((x) => x.id !== id));
+    }
+  };
+
+  const openEdit = (trip) => {
+    const s = new Date(trip.start.time);
+    const en = new Date(trip.end.time);
+    setEditForm({
+      date: toDateInputValue(s),
+      startTime: toTimeInputValue(s),
+      endTime: toTimeInputValue(en),
+      startAddress: trip.start.address,
+      endAddress: trip.end.address,
+      km: String(trip.km),
+      zweck: trip.zweck,
+      startOdo: trip.start.odoKm != null ? String(trip.start.odoKm) : "",
+      endOdo: trip.end.odoKm != null ? String(trip.end.odoKm) : "",
+      waypoints: (trip.waypoints || []).map((w) => w.address),
+    });
+    setEditingId(trip.id);
+    setEditError("");
+  };
+
+  const addEditWaypoint = () => setEditForm((f) => ({ ...f, waypoints: [...f.waypoints, ""] }));
+  const updateEditWaypoint = (i, value) =>
+    setEditForm((f) => {
+      const waypoints = [...f.waypoints];
+      waypoints[i] = value;
+      return { ...f, waypoints };
+    });
+  const removeEditWaypoint = (i) => setEditForm((f) => ({ ...f, waypoints: f.waypoints.filter((_, idx) => idx !== i) }));
+
+  const num = (v) => {
+    const n = parseFloat(String(v).replace(",", "."));
+    return isNaN(n) ? null : n;
+  };
+  const round1 = (n) => Math.round(n);
+
+  const editKmChange = (value) => {
+    setEditForm((f) => {
+      const startNum = num(f.startOdo);
+      const kmNum = num(value);
+      const endOdo = startNum != null && kmNum != null ? String(round1(startNum + kmNum)) : f.endOdo;
+      return { ...f, km: value, endOdo };
+    });
+  };
+
+  const editEndOdoChange = (value) => {
+    setEditForm((f) => {
+      const startNum = num(f.startOdo);
+      const endNum = num(value);
+      const km = startNum != null && endNum != null ? String(Math.max(0, round1(endNum - startNum))) : f.km;
+      return { ...f, endOdo: value, km };
+    });
+  };
+
+  const editStartOdoChange = (value) => {
+    setEditForm((f) => {
+      const startNum = num(value);
+      const kmNum = num(f.km);
+      const endOdo = startNum != null && kmNum != null ? String(round1(startNum + kmNum)) : f.endOdo;
+      return { ...f, startOdo: value, endOdo };
+    });
+  };
+
+  const saveEdit = async () => {
+    const f = editForm;
+    if (!f.date || !f.startTime || !f.endTime || !f.startAddress.trim() || !f.endAddress.trim() || !f.km || !f.zweck.trim()) {
+      setEditError("Bitte alle Pflichtfelder ausfüllen.");
+      return;
+    }
+    const startDate = new Date(`${f.date}T${f.startTime}:00`);
+    const endDate = new Date(`${f.date}T${f.endTime}:00`);
+    if (endDate <= startDate) {
+      setEditError("Die Endzeit muss nach der Startzeit liegen.");
+      return;
+    }
+    setEditSaving(true);
+    const [startAddr, endAddr] = await Promise.all([withPLZ(f.startAddress), withPLZ(f.endAddress)]);
+    const waypointAddrs = await Promise.all(f.waypoints.filter((w) => w.trim()).map((w) => withPLZ(w)));
+    setTrips((ts) =>
+      ts.map((t) =>
+        t.id === editingId
+          ? {
+              ...t,
+              start: { ...t.start, time: startDate.toISOString(), address: startAddr, odoKm: f.startOdo ? Math.round(parseFloat(f.startOdo.replace(",", "."))) : null },
+              end: { ...t.end, time: endDate.toISOString(), address: endAddr, odoKm: f.endOdo ? Math.round(parseFloat(f.endOdo.replace(",", "."))) : null },
+              km: Math.round(parseFloat(f.km.replace(",", "."))),
+              zweck: f.zweck.trim(),
+              waypoints: waypointAddrs.map((address) => ({ address, arrival: null, departure: null })),
+              edited: true,
+            }
+          : t
+      )
+    );
+    setEditSaving(false);
+    setEditingId(null);
+    setEditForm(null);
+  };
+
+  const openManualForm = () => {
+    const today = new Date().toISOString().slice(0, 10);
+    setManualForm({ date: today, startTime: "", endTime: "", startAddress: "", endAddress: "", km: "", zweck: "", waypoints: [] });
+    setManualError("");
+    setShowManual(true);
+  };
+
+  const addManualWaypoint = () => {
+    setManualForm((f) => ({ ...f, waypoints: [...f.waypoints, ""] }));
+  };
+
+  const updateManualWaypoint = (i, value) => {
+    setManualForm((f) => {
+      const waypoints = [...f.waypoints];
+      waypoints[i] = value;
+      return { ...f, waypoints };
+    });
+  };
+
+  const removeManualWaypoint = (i) => {
+    setManualForm((f) => ({ ...f, waypoints: f.waypoints.filter((_, idx) => idx !== i) }));
+  };
+
+  const saveManualTrip = async () => {
+    const { date, startTime, endTime, startAddress, endAddress, km, zweck, waypoints } = manualForm;
+    if (!date || !startTime || !endTime || !startAddress.trim() || !endAddress.trim() || !km || !zweck.trim()) {
+      setManualError("Bitte alle Felder ausfüllen.");
+      return;
+    }
+    const startDate = new Date(`${date}T${startTime}:00`);
+    const endDate = new Date(`${date}T${endTime}:00`);
+    if (endDate <= startDate) {
+      setManualError("Die Endzeit muss nach der Startzeit liegen.");
+      return;
+    }
+    setManualSaving(true);
+    const [startAddr, endAddr] = await Promise.all([withPLZ(startAddress), withPLZ(endAddress)]);
+    const waypointAddrs = await Promise.all((waypoints || []).filter((w) => w.trim()).map((w) => withPLZ(w)));
+    const trip = {
+      id: Date.now().toString(),
+      start: { time: startDate.toISOString(), address: startAddr },
+      end: { time: endDate.toISOString(), address: endAddr },
+      km: Math.round(parseFloat(km.replace(",", "."))),
+      zweck: zweck.trim(),
+      manual: true,
+      waypoints: waypointAddrs.map((address) => ({ address, arrival: null, departure: null })),
+    };
+    setTrips((t) => [trip, ...t]);
+    setManualSaving(false);
+    setShowManual(false);
+  };
+
+  const months = Array.from(new Set(trips.map((t) => t.start.time.slice(0, 7)))).sort().reverse();
+  const activeMonth = months.includes(month) || months.length === 0 ? month : months[0];
+
+  const monthTrips = trips
+    .filter((t) => t.start.time.slice(0, 7) === activeMonth)
+    .sort((a, b) => new Date(a.start.time) - new Date(b.start.time));
+  const monthKm = monthTrips.reduce((s, t) => s + t.km, 0);
+
+  const waypointsLabel = (t) =>
+    t.waypoints && t.waypoints.length
+      ? t.waypoints
+          .map((w) => (w.arrival && w.departure ? `${w.address} (${fmtTime(new Date(w.arrival))}–${fmtTime(new Date(w.departure))})` : w.address))
+          .join("; ")
+      : "";
+
+  const COLS = ["Datum", "Beginn", "Ende", "Startort", "Zwischenziele", "Zielort", "Km-Stand Start", "Km-Stand Ende", "Kilometer", "Zweck"];
+
+  const buildTripRows = (list) =>
+    list.map((t) => [
+      fmtDate(new Date(t.start.time)),
+      fmtTime(new Date(t.start.time)),
+      fmtTime(new Date(t.end.time)),
+      t.start.address,
+      waypointsLabel(t),
+      t.end.address,
+      t.start.odoKm != null ? Math.round(t.start.odoKm) : "",
+      t.end.odoKm != null ? Math.round(t.end.odoKm) : "",
+      Math.round(t.km),
+      t.zweck,
+    ]);
+
+  const tripRows = () => buildTripRows(monthTrips);
+
+  const exportExcel = () => {
+    const aoa = [
+      ["Fahrtenbuch – Monatsbericht"],
+      ["Fahrer:", FAHRER],
+      ["Fahrzeug:", FAHRZEUG],
+      ["Monat:", activeMonth],
+      [],
+      COLS,
+      ...tripRows(),
+      [],
+      ["", "", "", "", "", "Summe", "", "", Math.round(monthKm), ""],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{ wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 22 }, { wch: 28 }, { wch: 22 }, { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 22 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, activeMonth);
+    XLSX.writeFile(wb, `Fahrtenbuch_${activeMonth}.xlsx`);
+  };
+
+  const buildPdf = (list, subtitle, filename) => {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: "landscape" });
+    const sumKm = list.reduce((s, t) => s + t.km, 0);
+
+    doc.setFontSize(16);
+    doc.setTextColor(21, 128, 61);
+    doc.text("Fahrtenbuch – " + subtitle.title, 14, 16);
+
+    doc.setFontSize(10);
+    doc.setTextColor(60, 60, 60);
+    doc.text(`Fahrer: ${FAHRER}`, 14, 24);
+    doc.text(`Fahrzeug: ${FAHRZEUG}`, 14, 30);
+    doc.text(subtitle.rangeLabel, 14, 36);
+
+    doc.autoTable({
+      startY: 42,
+      head: [COLS],
+      body: buildTripRows(list),
+      foot: [["", "", "", "", "", "Summe", "", "", Math.round(sumKm), ""]],
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [21, 128, 61], textColor: 255, fontStyle: "bold" },
+      footStyles: { fillColor: [240, 253, 244], textColor: [21, 128, 61], fontStyle: "bold" },
+    });
+
+    doc.save(filename);
+    return sumKm;
+  };
+
+  const exportPDF = () => {
+    buildPdf(monthTrips, { title: "Monatsbericht", rangeLabel: `Monat: ${activeMonth}` }, `Fahrtenbuch_${activeMonth}.pdf`);
+  };
+
+  // Wöchentlicher Bericht: prüft beim Laden, ob für die abgeschlossene Vorwoche
+  // schon ein Bericht erstellt wurde, und bietet ihn sonst zum Download/Versand an.
+  const getLastWeekRange = () => {
+    const now = new Date();
+    const day = now.getDay();
+    const diffToMonday = day === 0 ? 6 : day - 1;
+    const thisMonday = new Date(now);
+    thisMonday.setHours(0, 0, 0, 0);
+    thisMonday.setDate(thisMonday.getDate() - diffToMonday);
+    const lastMonday = new Date(thisMonday);
+    lastMonday.setDate(lastMonday.getDate() - 7);
+    const lastSunday = new Date(thisMonday);
+    lastSunday.setDate(lastSunday.getDate() - 1);
+    lastSunday.setHours(23, 59, 59, 999);
+    return { start: lastMonday, end: lastSunday };
+  };
+
+  useEffect(() => {
+    const { start, end } = getLastWeekRange();
+    const key = toDateInputValue(start);
+    const already = localStorage.getItem(WEEK_REPORT_KEY);
+    const weekTrips = trips.filter((t) => {
+      const d = new Date(t.start.time);
+      return d >= start && d <= end;
+    });
+    if (already !== key && weekTrips.length > 0) {
+      setWeekReport({ start, end, key, trips: weekTrips });
+    } else {
+      setWeekReport(null);
+    }
+  }, [trips]);
+
+  const dismissWeekReport = () => {
+    if (weekReport) localStorage.setItem(WEEK_REPORT_KEY, weekReport.key);
+    setWeekReport(null);
+  };
+
+  const sendWeekReport = () => {
+    if (!weekReport) return;
+    const { start, end, trips: list, key } = weekReport;
+    const rangeLabel = `Zeitraum: ${fmtDate(start)} – ${fmtDate(end)}`;
+    const filename = `Fahrtenbuch_Woche_${key}.pdf`;
+    const sumKm = buildPdf(list, { title: "Wochenbericht", rangeLabel }, filename);
+
+    const subject = encodeURIComponent(`Fahrtenbuch Wochenbericht ${fmtDate(start)}–${fmtDate(end)}`);
+    const body = encodeURIComponent(
+      `Hallo,\n\nanbei der Fahrtenbuch-Wochenbericht für ${fmtDate(start)} bis ${fmtDate(end)}.\n` +
+      `Bitte die eben heruntergeladene Datei "${filename}" noch manuell an diese E-Mail anhängen.\n\n` +
+      `Fahrer: ${FAHRER}\nFahrzeug: ${FAHRZEUG}\nGesamtkilometer: ${Math.round(sumKm)} km`
+    );
+    window.location.href = `mailto:${REPORT_EMAIL}?subject=${subject}&body=${body}`;
+
+    localStorage.setItem(WEEK_REPORT_KEY, key);
+    setWeekReport(null);
+  };
+
+
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-stone-50 to-green-50/40 text-stone-900 pb-16 relative overflow-hidden">
+      <div className="pointer-events-none fixed -top-20 -right-16 w-72 h-72 bg-lime-300/30 rounded-full blur-3xl"></div>
+      <div className="pointer-events-none fixed top-1/3 -left-20 w-72 h-72 bg-green-300/30 rounded-full blur-3xl"></div>
+      <div className="h-2 bg-gradient-to-r from-green-700 via-green-600 to-lime-500"></div>
+      <div className="max-w-md mx-auto px-4 pt-6 relative z-10">
+        <header className="mb-5 pb-4 border-b-2 border-green-700">
+          <p className="text-sm font-extrabold tracking-widest uppercase bg-gradient-to-r from-green-700 to-lime-600 bg-clip-text text-transparent">LK Tirol</p>
+          <h1 className="text-3xl font-extrabold text-stone-900">Fahrtenbuch</h1>
+          <p className="text-xs text-stone-500 mt-0.5">Dienstwagen</p>
+        </header>
+
+        {weekReport && (
+          <div className="mb-4 bg-white border border-green-300 rounded-2xl p-4 shadow-sm">
+            <p className="text-sm font-bold text-green-800 mb-1">📄 Wochenbericht bereit</p>
+            <p className="text-xs text-stone-500 mb-3">
+              {fmtDate(weekReport.start)} – {fmtDate(weekReport.end)} · {weekReport.trips.length} Fahrt{weekReport.trips.length === 1 ? "" : "en"}
+            </p>
+            <div className="flex gap-2">
+              <button onClick={dismissWeekReport} className="flex-1 py-2 rounded-lg border border-stone-300 bg-white text-stone-600 text-xs font-medium">
+                Verwerfen
+              </button>
+              <button onClick={sendWeekReport} className="flex-1 py-2 rounded-lg bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 text-white text-xs font-bold">
+                PDF erstellen &amp; E-Mail vorbereiten
+              </button>
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div className="mb-4 flex items-start gap-2 bg-red-50 border border-red-200 text-red-800 text-sm rounded-lg p-3">
+            <span>⚠️</span><span>{error}</span>
+          </div>
+        )}
+
+        <div className="bg-white border border-stone-200 rounded-3xl p-5 mb-6 shadow-xl shadow-green-900/10 ring-1 ring-green-600/10">
+          {status === "idle" ? (
+            <div className="text-center py-2">
+              <p className="text-sm text-stone-500 mb-4">Bereit für die nächste Fahrt</p>
+              <button onClick={startTrip} className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 text-white font-bold rounded-2xl py-3.5 transition-all shadow-lg shadow-green-600/30">
+                ▶ Fahrt starten
+              </button>
+            </div>
+          ) : (
+            <div className="text-center py-1">
+              <div className="flex items-center justify-center gap-2 mb-3">
+                <span className="relative flex h-2.5 w-2.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-lime-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-gradient-to-r from-green-500 to-lime-400"></span>
+                </span>
+                <span className="text-xs uppercase tracking-widest text-green-700 font-bold">Aufzeichnung läuft</span>
+              </div>
+              <div className="font-mono text-4xl font-bold tabular-nums mb-1">{fmtElapsed(elapsed)}</div>
+              <div className="font-mono text-lg text-green-700/80 mb-4">{Math.round(liveKm)} km</div>
+              <button onClick={endTrip} className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-rose-600 to-orange-500 hover:from-rose-500 hover:to-orange-400 text-white font-bold rounded-2xl py-3.5 transition-all shadow-lg shadow-rose-600/30">
+                ■ Fahrt beenden
+              </button>
+              <p className="text-xs text-stone-400 mt-3">Diese Seite muss geöffnet bleiben, damit die Strecke erfasst wird.</p>
+            </div>
+          )}
+        </div>
+
+        {odoStep === "start" && (
+          <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
+            <div className="bg-white border border-stone-200 rounded-2xl p-5 w-full max-w-md shadow-2xl shadow-green-900/20 ring-1 ring-green-600/10">
+              <h2 className="font-bold text-lg mb-1">Kilometerstand bei Start</h2>
+              <p className="text-sm text-stone-500 mb-4">
+                Foto vom Tacho machen – die Zahl wird automatisch erkannt und kann korrigiert werden. Der Endstand wird später aus der zurückgelegten Strecke berechnet, kein zweites Foto nötig.
+              </p>
+
+              {needsStartAddress && (
+                <div className="mb-4">
+                  <div className="mb-2 flex items-start gap-2 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-lg p-2.5">
+                    <span>⚠️</span><span>Standort konnte nicht ermittelt werden. Bitte Startort von Hand eingeben.</span>
+                  </div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Startort</label>
+                  <input
+                    type="text"
+                    value={startAddressInput}
+                    onChange={(e) => setStartAddressInput(e.target.value)}
+                    placeholder="z. B. Innsbruck"
+                    className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm"
+                  />
+                </div>
+              )}
+
+              <label className="flex flex-col items-center justify-center w-full border-2 border-dashed border-stone-300 bg-stone-50 rounded-xl py-6 text-center text-stone-500 text-sm mb-3 cursor-pointer overflow-hidden">
+                {odoPhoto ? (
+                  <img src={odoPhoto} alt="Tacho" className="max-h-40 rounded-lg" />
+                ) : (
+                  <span>📷 Foto aufnehmen</span>
+                )}
+                <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handleOdoPhoto} />
+              </label>
+
+              {odoLoading && <p className="text-sm text-stone-500 mb-3">Zahl wird erkannt…</p>}
+              {odoError && (
+                <div className="mb-3 flex items-start gap-2 bg-red-50 border border-red-200 text-red-800 text-sm rounded-lg p-2.5">
+                  <span>⚠️</span><span>{odoError}</span>
+                </div>
+              )}
+
+              <label className="block text-xs font-semibold text-stone-500 mb-1">Kilometerstand</label>
+              <input
+                type="number"
+                inputMode="numeric"
+                value={odoValue}
+                onChange={(e) => setOdoValue(e.target.value)}
+                placeholder="z. B. 84213"
+                className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 mb-4 text-sm font-mono"
+              />
+
+              <div className="flex gap-2">
+                <button
+                  onClick={() => { setOdoValue(""); confirmStartOdo(""); }}
+                  className="flex-1 py-2.5 rounded-lg border border-stone-300 bg-white text-stone-600 text-sm font-medium"
+                >
+                  Ohne Kilometerstand
+                </button>
+                <button
+                  onClick={() => confirmStartOdo()}
+                  disabled={odoSaving}
+                  className="flex-1 py-2.5 rounded-lg bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 disabled:opacity-60 text-white text-sm font-bold"
+                >
+                  {odoSaving ? "PLZ wird ergänzt…" : "Übernehmen"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {endFallback && (
+          <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
+            <div className="bg-white border border-stone-200 rounded-2xl p-5 w-full max-w-md shadow-2xl shadow-green-900/20 ring-1 ring-green-600/10">
+              <h2 className="font-bold text-lg mb-1">Kilometerstand bei Ende</h2>
+              <p className="text-sm text-stone-500 mb-4">
+                {endFallback.reason === "gps"
+                  ? "Der Standort konnte am Fahrtende nicht ermittelt werden. Bitte Zielort und Kilometerstand von Hand eingeben."
+                  : "Die erfasste Strecke passt nicht plausibel zur Fahrzeit (GPS vermutlich unterbrochen). Bitte Kilometerstand von Hand eingeben."}
+              </p>
+
+              {endFallbackError && (
+                <div className="mb-3 flex items-start gap-2 bg-red-50 border border-red-200 text-red-800 text-sm rounded-lg p-2.5">
+                  <span>⚠️</span><span>{endFallbackError}</span>
+                </div>
+              )}
+
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-stone-500">Zwischenziele (optional)</label>
+                  <button type="button" onClick={addFallbackWaypoint} className="text-xs font-semibold text-green-700">＋ hinzufügen</button>
+                </div>
+                {endFallbackWaypoints.length === 0 && <p className="text-xs text-stone-400">Keine Zwischenziele erfasst.</p>}
+                <div className="space-y-2">
+                  {endFallbackWaypoints.map((w, i) => (
+                    <div key={i} className="flex gap-2">
+                      <input
+                        type="text"
+                        value={w}
+                        onChange={(e) => updateFallbackWaypoint(i, e.target.value)}
+                        placeholder={`Zwischenziel ${i + 1}, z. B. Innsbruck`}
+                        autoFocus={i === endFallbackWaypoints.length - 1 && !w}
+                        className="flex-1 border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm"
+                      />
+                      <button type="button" onClick={() => removeFallbackWaypoint(i)} className="text-stone-400 hover:text-red-500 px-2">✕</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-3 mb-4">
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Zielort</label>
+                  <input type="text" value={endFallbackForm.address} onChange={(e) => setEndFallbackForm({ ...endFallbackForm, address: e.target.value })} placeholder="z. B. Innsbruck" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                {startRef.current && startRef.current.odoKm != null && (
+                  <div>
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Km-Stand Ende</label>
+                    <input type="number" step="1" value={endFallbackForm.endOdo} onChange={(e) => fallbackEndOdoChange(e.target.value)} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm font-mono" />
+                  </div>
+                )}
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Gefahrene Kilometer</label>
+                  <input type="number" step="1" min="1" value={endFallbackForm.km} onChange={(e) => fallbackKmChange(e.target.value)} placeholder="leer lassen für automatische Berechnung" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                  <button
+                    type="button"
+                    onClick={calcRouteFromWaypoints}
+                    disabled={routeCalcLoading}
+                    className="text-xs font-semibold text-green-700 mt-1 disabled:opacity-60"
+                  >
+                    {routeCalcLoading ? "Route wird berechnet…" : "↻ Aus Start/Zwischenzielen/Ziel berechnen"}
+                  </button>
+                  {routeCalcError && <p className="text-xs text-red-600 mt-1">{routeCalcError}</p>}
+                  <p className="text-xs text-stone-400 mt-1">
+                    Bleiben Kilometer und Km-Stand Ende leer, berechnet die App die Strecke beim Übernehmen automatisch aus Start, Zwischenzielen und Ziel.
+                  </p>
+                  {endFallback.rawEstimate != null && (
+                    <p className="text-xs text-stone-400 mt-1">GPS hat vor dem Aussetzer ca. {endFallback.rawEstimate} km erfasst (unvollständig, nicht übernommen).</p>
+                  )}
+                </div>
+              </div>
+
+              <button onClick={confirmEndFallback} disabled={endFallbackSaving || routeCalcLoading} className="w-full py-2.5 rounded-lg bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 disabled:opacity-60 text-white text-sm font-bold">
+                {endFallbackSaving ? "Wird übernommen…" : "Übernehmen"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {pendingTrip && (
+          <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
+            <div className="bg-white border border-stone-200 rounded-2xl p-5 w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl shadow-green-900/20 ring-1 ring-green-600/10">
+              <h2 className="font-bold text-lg mb-1">Fahrt abschließen</h2>
+              <p className="text-sm text-stone-500 mb-4">
+                {pendingTrip.start.address} → {pendingTrip.end.address}
+              </p>
+
+              <div className="flex gap-3 mb-4">
+                <div className="flex-1">
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Km-Stand Start</label>
+                  <input type="number" step="1" value={pendingKmForm.startOdo} onChange={(e) => pendingStartOdoChange(e.target.value)} placeholder="optional" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm font-mono" />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Km-Stand Ende</label>
+                  <input type="number" step="1" value={pendingKmForm.endOdo} onChange={(e) => pendingEndOdoChange(e.target.value)} placeholder="optional" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm font-mono" />
+                </div>
+              </div>
+              <div className="mb-4">
+                <label className="block text-xs font-semibold text-stone-500 mb-1">Kilometer</label>
+                <input type="number" step="1" value={pendingKmForm.km} onChange={(e) => pendingKmChange(e.target.value)} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                <p className="text-xs text-stone-400 mt-1">Km-Stand Start/Ende und Kilometer gleichen sich automatisch aneinander an.</p>
+              </div>
+
+              <label className="block text-xs font-semibold text-stone-500 mb-1">Zweck</label>
+              <input autoFocus value={zweckInput} onChange={(e) => setZweckInput(e.target.value)} placeholder="Zweck eingeben…" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 mb-4 text-sm" />
+
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-stone-500">Zwischenziele (optional)</label>
+                  <button type="button" onClick={addPendingWaypoint} className="text-xs font-semibold text-green-700">＋ hinzufügen</button>
+                </div>
+                {pendingWaypoints.length === 0 && <p className="text-xs text-stone-400">Keine Zwischenziele erfasst.</p>}
+                <div className="space-y-2">
+                  {pendingWaypoints.map((w, i) => (
+                    <div key={i} className="flex gap-2 items-center">
+                      <input
+                        type="text"
+                        value={w.address}
+                        onChange={(e) => updatePendingWaypoint(i, e.target.value)}
+                        placeholder={`Zwischenziel ${i + 1}`}
+                        autoFocus={i === pendingWaypoints.length - 1 && !w.address}
+                        className="flex-1 border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm"
+                      />
+                      {w.arrival && w.departure && (
+                        <span className="text-xs text-stone-400 whitespace-nowrap">{fmtTime(new Date(w.arrival))}–{fmtTime(new Date(w.departure))}</span>
+                      )}
+                      <button type="button" onClick={() => removePendingWaypoint(i)} className="text-stone-400 hover:text-red-500 px-1">✕</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button onClick={discardTrip} className="flex-1 py-2.5 rounded-lg border border-stone-300 bg-white text-stone-600 text-sm font-medium">Verwerfen</button>
+                <button onClick={confirmZweck} disabled={!zweckInput.trim() || zweckSaving} className="flex-1 py-2.5 rounded-lg bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 disabled:from-stone-300 disabled:to-stone-300 disabled:text-stone-500 text-white text-sm font-bold">{zweckSaving ? "PLZ wird ergänzt…" : "Speichern"}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-bold text-stone-900">Fahrten</h2>
+          {months.length > 0 && (
+            <select value={activeMonth} onChange={(e) => setMonth(e.target.value)} className="text-sm border border-stone-300 bg-white text-stone-900 rounded-lg px-2 py-1">
+              {months.map((m) => (<option key={m} value={m}>{m}</option>))}
+            </select>
+          )}
+        </div>
+
+        <button onClick={openManualForm} className="w-full flex items-center justify-center gap-2 bg-white border border-stone-300 text-stone-600 font-semibold rounded-xl py-2.5 mb-3 text-sm">
+          ＋ Fahrt manuell hinzufügen
+        </button>
+
+        {editingId && editForm && (
+          <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
+            <div className="bg-white border border-stone-200 rounded-2xl p-5 w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl shadow-green-900/20 ring-1 ring-green-600/10">
+              <h2 className="font-bold text-lg mb-4">Fahrt bearbeiten</h2>
+
+              {editError && (
+                <div className="mb-3 flex items-start gap-2 bg-red-50 border border-red-200 text-red-800 text-sm rounded-lg p-2.5">
+                  <span>⚠️</span><span>{editError}</span>
+                </div>
+              )}
+
+              <div className="space-y-3 mb-4">
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Datum</label>
+                  <input type="date" value={editForm.date} onChange={(e) => setEditForm({ ...editForm, date: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Beginn</label>
+                    <input type="time" value={editForm.startTime} onChange={(e) => setEditForm({ ...editForm, startTime: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                  </div>
+                  <div className="flex-1">
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Ende</label>
+                    <input type="time" value={editForm.endTime} onChange={(e) => setEditForm({ ...editForm, endTime: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Startort</label>
+                  <input type="text" value={editForm.startAddress} onChange={(e) => setEditForm({ ...editForm, startAddress: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-semibold text-stone-500">Zwischenziele (optional)</label>
+                    <button type="button" onClick={addEditWaypoint} className="text-xs font-semibold text-green-700">＋ hinzufügen</button>
+                  </div>
+                  {editForm.waypoints.length === 0 && <p className="text-xs text-stone-400">Keine Zwischenziele erfasst.</p>}
+                  <div className="space-y-2">
+                    {editForm.waypoints.map((w, i) => (
+                      <div key={i} className="flex gap-2">
+                        <input type="text" value={w} onChange={(e) => updateEditWaypoint(i, e.target.value)} autoFocus={i === editForm.waypoints.length - 1 && !w} className="flex-1 border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                        <button type="button" onClick={() => removeEditWaypoint(i)} className="text-stone-400 hover:text-red-500 px-2">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Zielort</label>
+                  <input type="text" value={editForm.endAddress} onChange={(e) => setEditForm({ ...editForm, endAddress: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Km-Stand Start</label>
+                    <input type="number" value={editForm.startOdo} onChange={(e) => editStartOdoChange(e.target.value)} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm font-mono" />
+                  </div>
+                  <div className="flex-1">
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Km-Stand Ende</label>
+                    <input type="number" value={editForm.endOdo} onChange={(e) => editEndOdoChange(e.target.value)} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm font-mono" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Kilometer</label>
+                  <input type="number" step="1" value={editForm.km} onChange={(e) => editKmChange(e.target.value)} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                  <p className="text-xs text-stone-400 mt-1">Km-Stand Ende und Kilometer gleichen sich automatisch aneinander an.</p>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Zweck</label>
+                  <input type="text" value={editForm.zweck} onChange={(e) => setEditForm({ ...editForm, zweck: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 rounded-lg px-3 py-2 text-sm" />
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button onClick={() => { setEditingId(null); setEditForm(null); }} className="flex-1 py-2.5 rounded-lg border border-stone-300 bg-white text-stone-600 text-sm font-medium">Abbrechen</button>
+                <button onClick={saveEdit} disabled={editSaving} className="flex-1 py-2.5 rounded-lg bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 disabled:opacity-60 text-white text-sm font-bold">{editSaving ? "PLZ wird ergänzt…" : "Speichern"}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showManual && (
+          <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 p-4">
+            <div className="bg-white border border-stone-200 rounded-2xl p-5 w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl shadow-green-900/20 ring-1 ring-green-600/10">
+              <h2 className="font-bold text-lg mb-4">Fahrt manuell hinzufügen</h2>
+
+              {manualError && (
+                <div className="mb-3 flex items-start gap-2 bg-red-50 border border-red-200 text-red-800 text-sm rounded-lg p-2.5">
+                  <span>⚠️</span><span>{manualError}</span>
+                </div>
+              )}
+
+              <div className="space-y-3 mb-4">
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Datum</label>
+                  <input type="date" value={manualForm.date} onChange={(e) => setManualForm({ ...manualForm, date: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Beginn</label>
+                    <input type="time" value={manualForm.startTime} onChange={(e) => setManualForm({ ...manualForm, startTime: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                  </div>
+                  <div className="flex-1">
+                    <label className="block text-xs font-semibold text-stone-500 mb-1">Ende</label>
+                    <input type="time" value={manualForm.endTime} onChange={(e) => setManualForm({ ...manualForm, endTime: e.target.value })} className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Startort</label>
+                  <input type="text" value={manualForm.startAddress} onChange={(e) => setManualForm({ ...manualForm, startAddress: e.target.value })} placeholder="z. B. Wien" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-semibold text-stone-500">Zwischenziele (optional)</label>
+                    <button type="button" onClick={addManualWaypoint} className="text-xs font-semibold text-green-700">＋ hinzufügen</button>
+                  </div>
+                  {manualForm.waypoints.length === 0 && (
+                    <p className="text-xs text-stone-400">Keine Zwischenziele erfasst.</p>
+                  )}
+                  <div className="space-y-2">
+                    {manualForm.waypoints.map((w, i) => (
+                      <div key={i} className="flex gap-2">
+                        <input
+                          type="text"
+                          value={w}
+                          onChange={(e) => updateManualWaypoint(i, e.target.value)}
+                          placeholder={`Zwischenziel ${i + 1}, z. B. Innsbruck`}
+                          autoFocus={i === manualForm.waypoints.length - 1 && !w}
+                          className="flex-1 border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm"
+                        />
+                        <button type="button" onClick={() => removeManualWaypoint(i)} className="text-stone-400 hover:text-red-500 px-2">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Zielort</label>
+                  <input type="text" value={manualForm.endAddress} onChange={(e) => setManualForm({ ...manualForm, endAddress: e.target.value })} placeholder="z. B. Linz" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Kilometer</label>
+                  <input type="number" step="1" min="1" value={manualForm.km} onChange={(e) => setManualForm({ ...manualForm, km: e.target.value })} placeholder="z. B. 43" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-500 mb-1">Zweck</label>
+                  <input type="text" value={manualForm.zweck} onChange={(e) => setManualForm({ ...manualForm, zweck: e.target.value })} placeholder="Zweck eingeben…" className="w-full border border-stone-300 bg-white text-stone-900 placeholder-stone-400 rounded-lg px-3 py-2 text-sm" />
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button onClick={() => setShowManual(false)} className="flex-1 py-2.5 rounded-lg border border-stone-300 bg-white text-stone-600 text-sm font-medium">Abbrechen</button>
+                <button onClick={saveManualTrip} disabled={manualSaving} className="flex-1 py-2.5 rounded-lg bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 disabled:opacity-60 text-white text-sm font-bold">{manualSaving ? "PLZ wird ergänzt…" : "Speichern"}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {monthTrips.length > 0 && (
+          <div className="mb-4">
+            <p className="text-xs text-stone-500 mb-1.5">{activeMonth} · {Math.round(monthKm)} km gesamt</p>
+            <div className="flex gap-2">
+              <button onClick={exportPDF} className="flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 text-white font-bold rounded-xl py-2.5 text-sm shadow-md shadow-green-600/20">
+                📄 PDF
+              </button>
+              <button onClick={exportExcel} className="flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-green-600 to-lime-500 hover:from-green-500 hover:to-lime-400 text-white font-bold rounded-xl py-2.5 text-sm shadow-md shadow-green-600/20">
+                📊 Excel
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {monthTrips.length === 0 && (
+            <div className="text-center py-10 text-stone-400 text-sm border border-dashed border-stone-300 rounded-xl">
+              Noch keine Fahrten in diesem Monat.<br />Starte oben deine erste Fahrt.
+            </div>
+          )}
+          {[...monthTrips].reverse().map((t) => (
+            <div key={t.id} className="bg-white border border-stone-200 rounded-2xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-stone-500">
+                  🕐 {fmtDate(new Date(t.start.time))} · {fmtTime(new Date(t.start.time))}–{fmtTime(new Date(t.end.time))}
+                  {t.manual && <span className="ml-1.5 text-stone-400 font-normal">· manuell</span>}
+                  {t.edited && <span className="ml-1.5 text-stone-400 font-normal">· bearbeitet</span>}
+                </span>
+                <div className="flex items-center gap-3">
+                  <button onClick={() => openEdit(t)} className="text-stone-300 hover:text-green-700">✏️</button>
+                  <button onClick={() => deleteTrip(t.id)} className="text-stone-300 hover:text-red-500">🗑</button>
+                </div>
+              </div>
+              <div className="text-sm space-y-1 mb-2 text-stone-700">
+                <div className="flex items-start gap-1.5"><span className="text-green-700">📍</span><span>{t.start.address}</span></div>
+                {t.waypoints && t.waypoints.length > 0 && (
+                  <div className="flex items-start gap-1.5">
+                    <span className="text-amber-500">🅿️</span>
+                    <span className="text-stone-500">{waypointsLabel(t)}</span>
+                  </div>
+                )}
+                <div className="flex items-start gap-1.5"><span className="text-stone-400">➜</span><span>{t.end.address}</span></div>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="font-mono font-semibold text-stone-900">
+                  {Math.round(t.km)} km
+                  {t.start.odoKm != null && t.end.odoKm != null && (
+                    <span className="text-stone-400 font-normal"> ({Math.round(t.start.odoKm)}–{Math.round(t.end.odoKm)})</span>
+                  )}
+                </span>
+                <span className="text-stone-500">{t.zweck}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Fahrtenbuch />);
+</script>
+</body>
+</html>
